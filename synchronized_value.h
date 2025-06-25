@@ -157,54 +157,44 @@ public:
 
 private:
     void lock_all() {
-        while(true) {
-            //Build a vector of lock tasks for unlocked SVs
-            using lock_entry = std::tuple<void*, std::function<void()>>; // key = pointer, action = lock & mark
-            std::vector<lock_entry> lock_plan;
+        while (true) {
+            bool has_conflict = false;
 
-            std::vector<std::atomic<LockState>*> locks_to_wait_for;
+            //check for conflicts and wait if needed
             std::apply([&](auto*... svs) {
-                (..., ([&] {
+                (([&] {
                     LockState expected = LockState::Unlocked;
-                    if(svs->lock_state.compare_exchange_strong(expected, LockState::Scope)){
-                        lock_plan.emplace_back(
-                            static_cast<void*>(svs),
-                            [svs, this]() {
-                                svs->get_mutex().lock(); 
-                                svs->locker_thread_id = std::this_thread::get_id();
-                            }
-                        );
-                    }
-                    else
-                    {
+                    if (!svs->lock_state.compare_exchange_strong(expected, LockState::Scope)) {
+                        // If this thread already holds it in a scope: logic error
                         if (svs->locker_thread_id == std::this_thread::get_id()) {
                             throw std::logic_error("synchronized_value used in nested scope by the same thread");
                         }
-                        locks_to_wait_for.push_back(&svs->lock_state);
+                        has_conflict = true;
+                        svs->lock_state.wait(expected);
                     }
-                }()));
+                }()), ...);
             }, sv_ptrs);
 
-            if (!locks_to_wait_for.empty()) {
-                // Wait on all locked flags until they become false (unlocked)
-                for (auto atomic_lock : locks_to_wait_for) {
-                    // Wait while flag is true, unblock when false
-                    atomic_lock->wait(LockState::Scope);
+            if (has_conflict) {
+                continue; // retry whole lock sequence
+            }
+
+            //locks reserved, now acquire mutexes in address order
+            std::apply([&](auto*... svs) {
+                //sorted pack based on address to avoid deadlock
+                std::array<std::pair<void*, std::function<void()>>, sizeof...(svs)> locks = {{
+                    {static_cast<void*>(svs), [svs]() {
+                        svs->get_mutex().lock();
+                        svs->locker_thread_id = std::this_thread::get_id();
+                    }}...
+                }};
+
+                std::ranges::sort(locks, std::less<>{}, [](auto& pair) { return pair.first; });
+
+                for (auto& [_, fn] : locks) {
+                    fn();
                 }
-                // After waking, loop again to retry locking
-                continue;
-            }
-
-            //Sort by address to avoid deadlock
-            std::sort(lock_plan.begin(), lock_plan.end(),
-                    [](const lock_entry& a, const lock_entry& b) {
-                        return std::less<void*>{}(std::get<0>(a), std::get<0>(b));
-                    });
-
-            //Execute lock actions
-            for (auto& [_, action] : lock_plan) {
-                action();
-            }
+            }, sv_ptrs);
 
             return;
         }
