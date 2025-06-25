@@ -16,12 +16,17 @@
 template<typename... SVs>
 class synchronized_scope;
 
+enum class LockState : int {
+        Unlocked = 0,
+        Operator = 1,
+        Scope = 2
+    };
 template<typename T>
 class synchronized_value {
     T obj;
     mutable std::mutex mtx;
-    mutable std::mutex locker_room;
-    mutable std::atomic<bool> is_locked = false;
+    
+    mutable std::atomic<LockState> lock_state = LockState::Unlocked;
     mutable std::thread::id locker_thread_id; //for runtime error support while trying to lock same value from more scopes in single thread
 
     template<typename...>
@@ -31,24 +36,21 @@ class synchronized_value {
 
     // Called by synchronized_scope to acquire lock and mark participation
     void lock_for_scope() const {
-        std::scoped_lock guard(locker_room);
+        LockState expected = LockState::Unlocked;
+        while(!lock_state.compare_exchange_weak(expected, LockState::Scope))
+            expected = LockState::Unlocked;
         mtx.lock();
-        is_locked = true;
     }
 
     void unlock_from_scope() const {
-        std::scoped_lock guard(locker_room);
-        is_locked = false;
-        is_locked.notify_one();
+        lock_state = LockState::Unlocked;
+        lock_state.notify_one();
         mtx.unlock();
     }
 
 public:
     auto operator<=>(const synchronized_value& other) const {
-        // Create a scope that locks *this and other
         synchronized_scope scope(const_cast<synchronized_value&>(*this), const_cast<synchronized_value&>(other));
-
-        // Now both are locked safely; compare their objects directly
         return obj <=> other.obj;
     }
 
@@ -66,8 +68,8 @@ public:
     class access_proxy {
         T* ptr;
         std::unique_lock<std::mutex> lock;
-        bool owns_lock;
-
+        std::atomic<LockState>& lock_state;
+        
         struct no_escape_ptr {
             T* ptr;
             T* operator->() const { return ptr; }
@@ -81,11 +83,30 @@ public:
         access_proxy(access_proxy&&) = delete;
         access_proxy& operator=(access_proxy&&) = delete;
 
-        access_proxy(T* p, std::mutex& mtx, bool take_lock)
-            : ptr(p), owns_lock(take_lock)
+        ~access_proxy() {
+            if (lock.owns_lock()) {
+                lock_state.store(LockState::Unlocked);
+                lock_state.notify_one();
+            }
+        }
+
+        access_proxy(T* p, std::mutex& mtx, std::atomic<LockState>& state, std::thread::id& locker_id)
+            : ptr(p), lock_state(state)
         {
-            if (take_lock)
-                lock = std::unique_lock<std::mutex>(mtx);
+            LockState expected = LockState::Unlocked;
+
+            while (true) {
+                if (state.compare_exchange_weak(expected, LockState::Operator)) {
+                    lock = std::unique_lock<std::mutex>(mtx);
+                    break;
+                } else {
+                    if (expected == LockState::Scope && locker_id == std::this_thread::get_id()) {
+                        break;
+                    }
+                    state.wait(expected); // wait until the lock state changes
+                    expected = LockState::Unlocked;
+                }
+            }
         }
 
         no_escape_ptr operator->() { return no_escape_ptr{ptr}; }
@@ -108,12 +129,7 @@ public:
     };
 
     auto operator->() {
-        std::scoped_lock guard(locker_room);
-        if (is_locked) {
-            return access_proxy{&obj, mtx, false};  // already locked by scope
-        } else {
-            return access_proxy{&obj, mtx, true};   // lock it now
-        }
+        return access_proxy{&obj, mtx, lock_state, locker_thread_id};
     }
 
     auto operator*() {
@@ -142,25 +158,20 @@ public:
 private:
     void lock_all() {
         while(true) {
-            //Lock all locker_room mutexes at once (deadlock-free)
-            std::apply([](auto*... svs) {
-                std::scoped_lock lock(svs->locker_room...);
-            }, sv_ptrs);
-
             //Build a vector of lock tasks for unlocked SVs
             using lock_entry = std::tuple<void*, std::function<void()>>; // key = pointer, action = lock & mark
             std::vector<lock_entry> lock_plan;
 
-            std::vector<std::atomic<bool>*> locks_to_wait_for;
+            std::vector<std::atomic<LockState>*> locks_to_wait_for;
             std::apply([&](auto*... svs) {
                 (..., ([&] {
-                    if (!svs->is_locked) {
+                    LockState expected = LockState::Unlocked;
+                    if(svs->lock_state.compare_exchange_strong(expected, LockState::Scope)){
                         lock_plan.emplace_back(
                             static_cast<void*>(svs),
                             [svs, this]() {
                                 svs->get_mutex().lock(); 
                                 svs->locker_thread_id = std::this_thread::get_id();
-                                svs->is_locked.store(true); // do this only when actually tracked
                             }
                         );
                     }
@@ -169,7 +180,7 @@ private:
                         if (svs->locker_thread_id == std::this_thread::get_id()) {
                             throw std::logic_error("synchronized_value used in nested scope by the same thread");
                         }
-                        locks_to_wait_for.push_back(&svs->is_locked);
+                        locks_to_wait_for.push_back(&svs->lock_state);
                     }
                 }()));
             }, sv_ptrs);
@@ -178,7 +189,7 @@ private:
                 // Wait on all locked flags until they become false (unlocked)
                 for (auto atomic_lock : locks_to_wait_for) {
                     // Wait while flag is true, unblock when false
-                    atomic_lock->wait(true);
+                    atomic_lock->wait(LockState::Scope);
                 }
                 // After waking, loop again to retry locking
                 continue;
@@ -200,16 +211,14 @@ private:
     }
 
     void unlock_all() {
-        // Unlock and reset is_locked flags for all SVs
+        // Unlock and reset lock_state flags for all SVs
         std::apply([&](auto*... svs) {
             (([&] {
-                std::scoped_lock guard(svs->locker_room);
-                if (svs->is_locked) {
-                    svs->is_locked = false;
-                    svs->locker_thread_id = {};
-                    svs->get_mutex().unlock();
-                    svs->is_locked.notify_one();
-                }
+                svs->lock_state.store(LockState::Unlocked);
+                svs->locker_thread_id = {};
+                svs->get_mutex().unlock();
+                svs->lock_state.notify_one();
+                
             }()), ...);
         }, sv_ptrs);
     }
