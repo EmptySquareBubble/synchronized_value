@@ -1,5 +1,7 @@
 #include "synchronized_value.h"
 
+#include <print>
+
 struct cat {
     std::string name;
     int lives_cnt = 9;
