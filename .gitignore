@@ -1,0 +1,48 @@
+# CMake build directories
+/build/
+/build-*/
+/CMakeFiles/
+/CMakeCache.txt
+/cmake_install.cmake
+/Makefile
+/install_manifest.txt
+
+# Ninja build files
+/build.ninja
+/.ninja_deps
+/.ninja_log
+
+# Compiled object files, libraries, executables
+*.o
+*.obj
+*.lo
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.out
+
+# IDE / Editor files
+.vscode/
+.idea/
+*.sdf
+*.suo
+*.user
+*.userosscache
+*.ncb
+*.vcxproj*
+*.code-workspace
+compile_commands.json
+
+# OS junk files
+.DS_Store
+Thumbs.db
+
+# Tests and temporary files
+*.log
+*.tmp
+*.swp
+*~
