@@ -1,11 +1,8 @@
-#include <mutex>
-#include <tuple>
 #include <atomic>
-#include <ranges>
-#include <functional>
 #include <thread>
-#include <algorithm>
 #include <set>
+#include <utility>
+#include <compare>
 
 // ---------------------------
 // synchronized_value
