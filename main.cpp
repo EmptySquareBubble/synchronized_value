@@ -56,8 +56,7 @@ int main() {
         mourek->say_it();
 
         {
-            //synchronized_scope deeper_scope(mourek, pacicka); //err: synchronized_value used in nested scope by the same thread
-            synchronized_scope pacicka_scope(pacicka); 
+            synchronized_scope deeper_scope(mourek, pacicka); //mourek is already locked in this thread lock only pacicka
             std::print("Inside pacicka scope:\n");
             liza->say_it();
             pacicka->say_it();

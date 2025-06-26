@@ -5,6 +5,7 @@
 #include <functional>
 #include <thread>
 #include <algorithm>
+#include <set>
 
 // ---------------------------
 // synchronized_value
@@ -12,40 +13,34 @@
 template <typename... SVs>
 class synchronized_scope;
 
-enum class LockState : int
-{
-    Unlocked = 0,
-    Operator = 1,
-    Scope = 2
-};
 template <typename T>
 class synchronized_value
 {
     T obj;
-    mutable std::mutex mtx;
-
-    mutable std::atomic<LockState> lock_state = LockState::Unlocked;
-    mutable std::thread::id locker_thread_id; // for runtime error support while trying to lock same value from more scopes in single thread
+    mutable std::atomic<std::thread::id> locker_thread_id; // for runtime error support while trying to lock same value from more scopes in single thread
 
     template <typename...>
     friend class synchronized_scope;
 
-    std::mutex &get_mutex() const noexcept { return mtx; }
-
     // Called by synchronized_scope to acquire lock and mark participation
-    void lock_for_scope() const
+    bool lock_for_scope() const
     {
-        LockState expected = LockState::Unlocked;
-        while (!lock_state.compare_exchange_weak(expected, LockState::Scope))
-            expected = LockState::Unlocked;
-        mtx.lock();
+        const auto current_thread_id = std::this_thread::get_id();
+        // already locked for by current thread
+        if (locker_thread_id == current_thread_id)
+            return false;
+
+        std::thread::id expected = std::thread::id{};
+        while (!locker_thread_id.compare_exchange_weak(expected, current_thread_id, std::memory_order_acquire, std::memory_order_relaxed))
+            expected = std::thread::id{};
+
+        return true;
     }
 
     void unlock_from_scope() const
     {
-        lock_state = LockState::Unlocked;
-        lock_state.notify_one();
-        mtx.unlock();
+        locker_thread_id.store(std::thread::id{});
+        locker_thread_id.notify_one();
     }
 
 public:
@@ -71,8 +66,8 @@ public:
     class access_proxy
     {
         T *ptr;
-        std::unique_lock<std::mutex> lock;
-        std::atomic<LockState> &lock_state;
+        bool owns_lock = false;
+        std::atomic<std::thread::id> *locker_thread_id;
 
         struct no_escape_ptr
         {
@@ -91,35 +86,26 @@ public:
 
         ~access_proxy()
         {
-            if (lock.owns_lock())
+            if (owns_lock)
             {
-                lock_state.store(LockState::Unlocked);
-                lock_state.notify_one();
+                locker_thread_id->store(std::thread::id{});
+                locker_thread_id->notify_one();
             }
         }
 
-        access_proxy(T *p, std::mutex &mtx, std::atomic<LockState> &state, std::thread::id &locker_id)
-            : ptr(p), lock_state(state)
+        access_proxy(T *p, std::atomic<std::thread::id> *id)
+            : ptr(p), locker_thread_id(id)
         {
-            LockState expected = LockState::Unlocked;
 
-            while (true)
-            {
-                if (state.compare_exchange_weak(expected, LockState::Operator))
-                {
-                    lock = std::unique_lock<std::mutex>(mtx);
-                    break;
-                }
-                else
-                {
-                    if (expected == LockState::Scope && locker_id == std::this_thread::get_id())
-                    {
-                        break;
-                    }
-                    state.wait(expected); // wait until the lock state changes
-                    expected = LockState::Unlocked;
-                }
-            }
+            const auto current_thread_id = std::this_thread::get_id();
+            // already locked for by current thread
+            if (locker_thread_id->load() == current_thread_id)
+                return;
+
+            owns_lock = true;
+            auto expected = std::thread::id{};
+            while (!locker_thread_id->compare_exchange_weak(expected, current_thread_id, std::memory_order_acquire, std::memory_order_relaxed))
+                expected = std::thread::id{};
         }
 
         no_escape_ptr operator->() { return no_escape_ptr{ptr}; }
@@ -146,7 +132,7 @@ public:
 
     auto operator->()
     {
-        return access_proxy{&obj, mtx, lock_state, locker_thread_id};
+        return access_proxy{&obj, &locker_thread_id};
     }
 
     auto operator*()
@@ -161,79 +147,30 @@ public:
 template <typename... SVs>
 class synchronized_scope
 {
-    std::tuple<SVs *...> sv_ptrs;
+    std::set<std::atomic<std::thread::id> *> sorted_vals;
 
 public:
     synchronized_scope(SVs &...svs)
-        : sv_ptrs(&svs...)
     {
-        lock_all();
+        const auto current_thread_id = std::this_thread::get_id();
+
+        (([&]
+          {
+            if (svs.locker_thread_id != current_thread_id)
+                sorted_vals.insert(&(svs.locker_thread_id)); }()),
+         ...);
+
+        for (auto &val : sorted_vals)
+        {
+            auto expected = std::thread::id{};
+            while (!val->compare_exchange_weak(expected, current_thread_id, std::memory_order_acquire, std::memory_order_relaxed))
+                expected = std::thread::id{};
+        }
     }
 
     ~synchronized_scope()
     {
-        unlock_all();
-    }
-
-private:
-    void lock_all()
-    {
-        while (true)
-        {
-            bool has_conflict = false;
-
-            // check for conflicts and wait if needed
-            std::apply([&](auto *...svs)
-                       { (([&]
-                           {
-                    LockState expected = LockState::Unlocked;
-                    if (!svs->lock_state.compare_exchange_strong(expected, LockState::Scope)) {
-                        // If this thread already holds it in a scope: logic error
-                        if (svs->locker_thread_id == std::this_thread::get_id()) {
-                            throw std::logic_error("synchronized_value used in nested scope by the same thread");
-                        }
-                        has_conflict = true;
-                        svs->lock_state.wait(expected);
-                    } }()),
-                          ...); }, sv_ptrs);
-
-            if (has_conflict)
-            {
-                continue; // retry whole lock sequence
-            }
-
-            // locks reserved, now acquire mutexes in address order
-            std::apply([&](auto *...svs)
-                       {
-                //sorted pack based on address to avoid deadlock
-                std::array<std::pair<void*, std::function<void()>>, sizeof...(svs)> locks = {{
-                    {static_cast<void*>(svs), [svs]() {
-                        svs->get_mutex().lock();
-                        svs->locker_thread_id = std::this_thread::get_id();
-                    }}...
-                }};
-
-                std::ranges::sort(locks, std::less<>{}, [](auto& pair) { return pair.first; });
-
-                for (auto& [_, fn] : locks) {
-                    fn();
-                } }, sv_ptrs);
-
-            return;
-        }
-    }
-
-    void unlock_all()
-    {
-        // Unlock and reset lock_state flags for all SVs
-        std::apply([&](auto *...svs)
-        { (([&]
-            {
-                svs->locker_thread_id = {};
-                svs->get_mutex().unlock();
-                svs->lock_state.store(LockState::Unlocked);
-                svs->lock_state.notify_one();
-            }()),
-            ...); }, sv_ptrs);
+        for (auto val : sorted_vals)
+            val->store(std::thread::id{});
     }
 };
