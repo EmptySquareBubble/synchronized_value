@@ -17,31 +17,10 @@ template <typename T>
 class synchronized_value
 {
     T obj;
-    mutable std::atomic<std::thread::id> locker_thread_id; // for runtime error support while trying to lock same value from more scopes in single thread
+    mutable std::atomic<std::thread::id> locker_thread_id;
 
     template <typename...>
     friend class synchronized_scope;
-
-    // Called by synchronized_scope to acquire lock and mark participation
-    bool lock_for_scope() const
-    {
-        const auto current_thread_id = std::this_thread::get_id();
-        // already locked for by current thread
-        if (locker_thread_id == current_thread_id)
-            return false;
-
-        std::thread::id expected = std::thread::id{};
-        while (!locker_thread_id.compare_exchange_weak(expected, current_thread_id, std::memory_order_acquire, std::memory_order_relaxed))
-            expected = std::thread::id{};
-
-        return true;
-    }
-
-    void unlock_from_scope() const
-    {
-        locker_thread_id.store(std::thread::id{});
-        locker_thread_id.notify_one();
-    }
 
 public:
     auto operator<=>(const synchronized_value &other) const
@@ -87,10 +66,7 @@ public:
         ~access_proxy()
         {
             if (owns_lock)
-            {
-                locker_thread_id->store(std::thread::id{});
-                locker_thread_id->notify_one();
-            }
+                locker_thread_id->store(std::thread::id{}, std::memory_order_release);
         }
 
         access_proxy(T *p, std::atomic<std::thread::id> *id)
@@ -98,8 +74,9 @@ public:
         {
 
             const auto current_thread_id = std::this_thread::get_id();
+            
             // already locked for by current thread
-            if (locker_thread_id->load() == current_thread_id)
+            if (locker_thread_id->load(std::memory_order_relaxed) == current_thread_id)
                 return;
 
             owns_lock = true;
@@ -111,7 +88,6 @@ public:
         no_escape_ptr operator->() { return no_escape_ptr{ptr}; }
         T &operator*() { return *ptr; }
 
-        // Add assignment operator to forward to the underlying object
         access_proxy &operator=(const T &rhs)
         {
             *ptr = rhs;
@@ -126,7 +102,7 @@ public:
 
         operator T() const
         {
-            return *ptr; // ptr is locked via unique_lock in proxy
+            return *ptr; 
         }
     };
 
@@ -156,7 +132,7 @@ public:
 
         (([&]
           {
-            if (svs.locker_thread_id != current_thread_id)
+            if (svs.locker_thread_id.load(std::memory_order_relaxed) != current_thread_id)
                 sorted_vals.insert(&(svs.locker_thread_id)); }()),
          ...);
 
@@ -171,6 +147,6 @@ public:
     ~synchronized_scope()
     {
         for (auto val : sorted_vals)
-            val->store(std::thread::id{});
+            val->store(std::thread::id{}, std::memory_order_release);
     }
 };
