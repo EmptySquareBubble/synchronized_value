@@ -227,13 +227,13 @@ private:
     {
         // Unlock and reset lock_state flags for all SVs
         std::apply([&](auto *...svs)
-                   { (([&]
-                       {
-                           svs->lock_state.store(LockState::Unlocked);
-                           svs->locker_thread_id = {};
-                           svs->get_mutex().unlock();
-                           svs->lock_state.notify_one();
-                       }()),
-                      ...); }, sv_ptrs);
+        { (([&]
+            {
+                svs->locker_thread_id = {};
+                svs->get_mutex().unlock();
+                svs->lock_state.store(LockState::Unlocked);
+                svs->lock_state.notify_one();
+            }()),
+            ...); }, sv_ptrs);
     }
 };
