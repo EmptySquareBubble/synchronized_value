@@ -7,7 +7,15 @@ struct cat {
     int lives_cnt = 9;
 
     cat(std::string n) : name(std::move(n)) {}
-    void say_it() const { std::print("{} says meow\n", name); }
+    void say_it(int offset = 0) const 
+    { 
+        while(offset > 0)
+        {
+            std::print("--");
+            --offset;
+        }
+        std::print("{} says meow\n", name); 
+    }
     void set_name(const std::string& n) { name = n; }
 
     auto operator<=>(const cat& other) const {
@@ -25,7 +33,6 @@ int main() {
     //you can access their functions/member directly 
     //operator -> is there to give you hint you are not dealing with naked type itself
     //everything will be accessed under the lock which is unlocked immediately
-    std::print("Outside scope:\n");
     liza->say_it();
     mourek->say_it();
 
@@ -38,7 +45,7 @@ int main() {
         std::print("snizek has more lives than liza\n");
     else
         std::print("liza has more lives than snizek\n");
-
+    
     if(mourek > liza)
         std::print("mourek has more lives than liza\n");
     else
@@ -49,24 +56,21 @@ int main() {
         //scope takes arbitrary number of synchronized_values and lock them during construction
         //during it's whole lifetime liza and mourek will be locked
         synchronized_scope scope(liza, mourek);
-        std::print("Inside scope:\n");
-
+        
         //this access say_it directly
-        liza->say_it();
-        mourek->say_it();
+        liza->say_it(1);
+        mourek->say_it(1);
 
         {
             synchronized_scope deeper_scope(mourek, pacicka); //mourek is already locked in this thread lock only pacicka
-            std::print("Inside pacicka scope:\n");
-            liza->say_it();
-            pacicka->say_it();
+            liza->say_it(2);
+            pacicka->say_it(2);
         }
 
         *mourek = cat{"Mourek Updated"};
-        mourek->say_it();
+        mourek->say_it(1);
     }
 
-    std::print("Outside scope again:\n");
     liza->say_it();
     mourek->say_it();
 

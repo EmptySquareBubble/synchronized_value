@@ -3,23 +3,52 @@
 #include <set>
 #include <utility>
 #include <compare>
+#include <mutex>
+#include <concepts>
 
 // ---------------------------
 // synchronized_value
 // ---------------------------
-template <typename... SVs>
+template<typename T>
+concept SynchronizedValue = requires { typename T::lockable_type;   };
+
+template <SynchronizedValue... SVs>
 class synchronized_scope;
 
+namespace detail{
+    struct lockable
+    {
+        std::atomic<std::thread::id> locker_thread_id;
+        
+        void lock()
+        {
+            const auto current_thread_id = std::this_thread::get_id();
+                
+            auto expected = std::thread::id{};
+            while (!locker_thread_id.compare_exchange_weak(expected, current_thread_id, std::memory_order_acquire, std::memory_order_relaxed))
+                expected = std::thread::id{};
+        }
+
+        void unlock()
+        {
+            locker_thread_id.store(std::thread::id{}, std::memory_order_release);
+        }
+
+        bool try_lock()
+        {
+            const auto current_thread_id = std::this_thread::get_id();
+                
+            auto expected = std::thread::id{};
+            return locker_thread_id.compare_exchange_strong(expected, current_thread_id, std::memory_order_acquire, std::memory_order_relaxed);    
+        }
+    };
+}
 template <typename T>
 class synchronized_value
 {
-    T obj;
-    mutable std::atomic<std::thread::id> locker_thread_id;
-
-    template <typename...>
-    friend class synchronized_scope;
-
 public:
+    using lockable_type = detail::lockable;
+
     auto operator<=>(const synchronized_value &other) const
     {
         synchronized_scope scope(const_cast<synchronized_value &>(*this), const_cast<synchronized_value &>(other));
@@ -32,7 +61,6 @@ public:
         return obj == other.obj;
     }
 
-public:
     template <typename U>
     synchronized_value(U &&val) : obj(std::forward<U>(val)) {}
 
@@ -41,14 +69,12 @@ public:
 
     class access_proxy
     {
-        T *ptr;
+        synchronized_value<T>& ptr;
         bool owns_lock = false;
-        std::atomic<std::thread::id> *locker_thread_id;
-
         struct no_escape_ptr
         {
-            T *ptr;
-            T *operator->() const { return ptr; }
+            T *obj;
+            T *operator->() const { return obj; }
 
             // prevent implicit conversion to T*
             operator T *() const = delete;
@@ -63,87 +89,76 @@ public:
         ~access_proxy()
         {
             if (owns_lock)
-                locker_thread_id->store(std::thread::id{}, std::memory_order_release);
+                ptr.lock.unlock();
         }
 
-        access_proxy(T *p, std::atomic<std::thread::id> *id)
-            : ptr(p), locker_thread_id(id)
+        access_proxy(synchronized_value<T> &p)
+            : ptr(p)
         {
 
             const auto current_thread_id = std::this_thread::get_id();
             
-            // already locked for by current thread
-            if (locker_thread_id->load(std::memory_order_relaxed) == current_thread_id)
+            // already locked by current thread
+            if (ptr.lock.locker_thread_id.load(std::memory_order_relaxed) == current_thread_id)
                 return;
 
             owns_lock = true;
-            auto expected = std::thread::id{};
-            while (!locker_thread_id->compare_exchange_weak(expected, current_thread_id, std::memory_order_acquire, std::memory_order_relaxed))
-                expected = std::thread::id{};
+            ptr.lock.lock();
         }
 
-        no_escape_ptr operator->() { return no_escape_ptr{ptr}; }
-        T &operator*() { return *ptr; }
+        no_escape_ptr operator->() { return no_escape_ptr{&(ptr.obj)}; }
+        T &operator*() { return ptr.obj; }
 
         access_proxy &operator=(const T &rhs)
         {
-            *ptr = rhs;
+            ptr.obj = rhs;
             return *this;
         }
 
         access_proxy &operator=(T &&rhs)
         {
-            *ptr = std::move(rhs);
+            ptr.obj = std::move(rhs);
             return *this;
         }
 
         operator T() const
         {
-            return *ptr; 
+            return ptr.obj; 
         }
     };
 
     auto operator->()
     {
-        return access_proxy{&obj, &locker_thread_id};
+        return access_proxy{*this};
     }
 
     auto operator*()
     {
         return operator->();
     }
+    
+    private:
+        lockable_type lock;
+        T obj;
+        
+        template <SynchronizedValue... SVs>
+        friend class synchronized_scope;
 };
 
 // ---------------------------
 // synchronized_scope
 // ---------------------------
-template <typename... SVs>
+template <SynchronizedValue... SVs>
 class synchronized_scope
 {
-    std::set<std::atomic<std::thread::id> *> sorted_vals;
+    detail::lockable dummy_lock;
+    std::scoped_lock<typename SVs::lockable_type& ...> lock;
 
 public:
-    synchronized_scope(SVs &...svs)
-    {
-        const auto current_thread_id = std::this_thread::get_id();
-
-        (([&]
-          {
-            if (svs.locker_thread_id.load(std::memory_order_relaxed) != current_thread_id)
-                sorted_vals.insert(&(svs.locker_thread_id)); }()),
-         ...);
-
-        for (auto &val : sorted_vals)
-        {
-            auto expected = std::thread::id{};
-            while (!val->compare_exchange_weak(expected, current_thread_id, std::memory_order_acquire, std::memory_order_relaxed))
-                expected = std::thread::id{};
-        }
-    }
-
-    ~synchronized_scope()
-    {
-        for (auto val : sorted_vals)
-            val->store(std::thread::id{}, std::memory_order_release);
-    }
+    synchronized_scope(SVs &... svs)
+        : dummy_lock{},
+          lock( (svs.lock.locker_thread_id.load(std::memory_order_relaxed) != std::this_thread::get_id()
+                    ? svs.lock
+                    : dummy_lock) ... )
+    {}
 };
